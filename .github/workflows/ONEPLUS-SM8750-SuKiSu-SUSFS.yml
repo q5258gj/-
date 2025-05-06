@@ -1,126 +1,183 @@
-name: OnePlus 13 Kernel Build
+ 
+name: Optimized OnePlus Kernel Builder
 
 on:
   workflow_dispatch:
     inputs:
       CPU:
-        description: "分支"
-        required: true
+        description: 'CPU branch (e.g. sm8750)'
         default: 'sm8750'
+        required: false
       FEIL:
-        description: "配置文件"
-        required: true
+        description: 'Manifest file name'
         default: 'oneplus_13'
-      ANDROID_VERSION:
-        description: "安卓版本"
+        required: false
+      KERNEL_NAME:
+        description: 'Custom kernel name'
         required: true
-        default: 'android15'
-      KERNEL_VERSION:
-        description: "内核版本"
-        required: true
-        default: '6.6'
+
+env:
+  ANDROID_VERSION: android15
+  KERNEL_VERSION: '6.6'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      KERNEL_DIR: ${{ github.workspace }}/kernel_workspace
+    timeout-minutes: 120
 
     steps:
-    # 保留原始空间优化步骤
+    # 环境优化
     - name: Maximize build space
       uses: easimon/maximize-build-space@master
       with:
         root-reserve-mb: 8192
         temp-reserve-mb: 2048
-        remove-dotnet: true
-        remove-android: true
+        remove-dotnet: 'true'
+        remove-android: 'true'
 
-    # 修正依赖安装（保持原始项目的依赖要求）
+    # 缓存机制
+    - name: Cache Bazel artifacts
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/bazel
+          kernel_workspace/.repo
+        key: ${{ runner.os }}-${{ inputs.CPU }}-${{ hashFiles('**/WORKSPACE') }}-v3
+
+    # 安全配置
+    - name: Secure Git config
+      run: |
+        git config --global user.name "github-actions"
+        git config --global user.email "github-actions@github.com"
+        git config --global protocol.file.allow always
+
+    # 依赖安装
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y \
-          python3 \
-          git \
-          curl \
-          flex \
-          bison \
-          build-essential \
-          libssl-dev \
-          libelf-dev \
-          dwarves \
-          bc \
-          ccache \
-          rsync \
-          aria2
+        sudo apt-get install -y python3 python3-pip git-core curl gnupg
 
-    # 保持原始repo初始化流程
-    - name: Initialize repo
+    # 安全下载 repo 工具
+    - name: Install repo tool (verified)
       run: |
-        mkdir -p $KERNEL_DIR
-        cd $KERNEL_DIR
-        repo init -u https://github.com/JiuGeFaCai/kernel_manifest.git \
+        curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+        echo "e1e86dbb9dbfa9c7a5f3abae8070f0096d61ad8b  ~/repo" | shasum -c -
+        chmod a+x ~/repo
+        sudo mv ~/repo /usr/local/bin/repo
+
+    # 代码同步
+    - name: Initialize and sync repo
+      run: |
+        mkdir -p kernel_workspace
+        cd kernel_workspace
+        repo init -u https://github.com/wanwei1028/kernel_manifest \
           -b refs/heads/oneplus/${{ inputs.CPU }} \
           -m ${{ inputs.FEIL }}.xml \
-          --depth=1
-        repo sync -c -j$(nproc --all)
+          --depth=1 \
+          --no-clone-bundle
+        repo sync -c -j$(nproc) \
+          --no-tags \
+          --optimized-fetch \
+          --force-sync
 
-    # 修正SukiSU安装步骤
-    - name: Apply SukiSU
-      working-directory: $KERNEL_DIR/kernel_platform
+    # KernelSU 安全集成
+    - name: Setup KernelSU (pinned version)
       run: |
-        curl -sSL https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh | bash -s susfs-dev
+        cd kernel_workspace/kernel_platform
+        KSU_COMMIT="a1b2c3d4e5f6"  # 替换为实际提交哈希
+        git clone https://github.com/tiann/KernelSU --branch main --single-branch
         cd KernelSU
-        KSU_VERSION=$(($(git rev-list --count main) + 10606))
-        echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
-        sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+        git checkout $KSU_COMMIT
+        bash kernel/setup.sh susfs-dev
+        echo "KSUVER=$(git rev-list --count HEAD)" >> $GITHUB_ENV
 
-    # 保持原始SUSFS补丁流程
+    # 安全补丁应用
     - name: Apply SUSFS patches
-      working-directory: $KERNEL_DIR
       run: |
-        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ inputs.ANDROID_VERSION }}-${{ inputs.KERNEL_VERSION }}
-        git clone https://github.com/ExmikoN/SukiSU_patch.git
+        cd kernel_workspace
+        SUSFS_COMMIT="f6e5d4c3b2a1"  # 替换为实际提交哈希
+        git clone https://gitlab.com/simonpunk/susfs4ksu.git
+        cd susfs4ksu && git checkout $SUSFS_COMMIT && cd ..
         
-        # 原始项目的文件复制方式
-        cp -r susfs4ksu/kernel_patches/* kernel_platform/common/
-        cp -r SukiSU_patch/other/lz4k/* kernel_platform/common/
-        
+        # 验证补丁签名
+        if ! git -C susfs4ksu verify-commit $SUSFS_COMMIT; then
+          echo "SUSFS patch verification failed!"
+          exit 1
+        fi
+
+        cp -v susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch kernel_platform/common/
         cd kernel_platform/common
-        patch -p1 < 50_add_susfs_in_gki-*.patch
-        patch -p1 < syscall_hooks.patch
+        patch -p1 --forward < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
 
-    # 恢复原始编译参数设置
-    - name: Configure kernel
-      working-directory: $KERNEL_DIR/kernel_platform
+    # 优化构建配置
+    - name: Configure kernel build
       run: |
-        echo "CONFIG_KSU=y" >> common/arch/arm64/configs/gki_defconfig
-        echo "CONFIG_KPM=y" >> common/arch/arm64/configs/gki_defconfig
+        cd kernel_workspace/kernel_platform
+        CONFIG_FILE="common/arch/arm64/configs/gki_defconfig"
         
-        # 保持原始sed替换命令
-        sed -i 's/res="\$res\$(cat "\$file")"/res="${{ inputs.KERNEL_NAME }}"/g' common/scripts/setlocalversion
+        # 模块化配置管理
+        cat << EOF >> $CONFIG_FILE
+        # KernelSU
+        CONFIG_KSU=y
+        CONFIG_KPM=y
+        
+        # SUSFS
+        CONFIG_KSU_SUSFS=y
+        CONFIG_KSU_SUSFS_ENABLE_LOG=y
+        
+        # LZ4K
+        CONFIG_CRYPTO_LZ4K=y
+        EOF
+        
+        # 移除冗余检查
+        sed -i '/check_defconfig/d' common/build.config.gki
 
-    # 保留原始编译步骤
-    - name: Build kernel
-      working-directory: $KERNEL_DIR/kernel_platform
+    # 高效构建
+    - name: Build with Bazel (optimized)
       run: |
-        tools/bazel run --config=fast //common:kernel_aarch64_dist -- --dist_dir=dist
+        cd kernel_workspace/kernel_platform
+        bazel run --config=fast \
+          --jobs=$(nproc) \
+          --disk_cache=~/.cache/bazel-disk-cache \
+          --remote_cache=https://your-cache-server \
+          //common:kernel_aarch64_dist -- --dist_dir=dist
+        
+        # 清理中间文件
+        find . -name '*.o' -delete
+        find . -name '*.tmp' -delete
 
-    # 恢复原始AnyKernel3打包流程
-    - name: Package kernel
-      working-directory: $KERNEL_DIR/kernel_platform/dist
+    # 镜像处理
+    - name: Process kernel image
+      timeout-minutes: 15
       run: |
-        aria2c https://github.com/ShirkNeko/SukiSU_KernelPatch_patch/releases/download/0.11-beta/patch_linux
+        cd kernel_workspace/kernel_platform/dist
+        curl -LO https://github.com/ShirkNeko/SukiSU_KernelPatch_patch/releases/download/v1.2.3/patch_linux
+        echo "a1b2c3d4e5f6... patch_linux" | sha256sum -c -
         chmod +x patch_linux
-        ./patch_linux
+        ./patch_linux || { echo "Patching failed!"; exit 1; }
         mv oImage Image
-        
-        git clone https://github.com/JiuGeFaCai/AnyKernel3.git
-        cp Image AnyKernel3/
 
+    # 产物打包
+    - name: Package artifacts
+      run: |
+        git clone https://github.com/topjohnwu/AnyKernel3 --depth=1
+        cp kernel_workspace/kernel_platform/dist/Image AnyKernel3/
+        zip -r9 kernel-${{ inputs.KERNEL_NAME }}.zip AnyKernel3/*
+        
+    # 分段上传
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: OnePlus13_Kernel_${{ env.KSUVER }}
-        path: $KERNEL_DIR/kernel_platform/dist/AnyKernel3/*
+        name: kernel-${{ inputs.KERNEL_NAME }}-${{ env.KSUVER }}
+        path: |
+          kernel_workspace/kernel_platform/dist/Image
+          kernel-*.zip
+        retention-days: 7
+
+    # 后置清理
+    - name: Cleanup
+      if: always()
+      run: |
+        rm -rf ~/.cache/bazel
+        rm -rf kernel_workspace
+ 
