@@ -1,132 +1,138 @@
-name: OnePlus SM8750 Build Pipeline
+name: OnePlus SM8750 High-Efficiency Build Pipeline
 on:
   workflow_dispatch:
     inputs:
       DEVICE:
-        description: "设备分支"
+        description: "设备分支（如sm8750）"
         required: true
-        default: 'sm8750'
-      CONFIG:
-        description: "配置文件"
-        required: true
-        default: 'oneplus_13'
-      KERNEL_TAG:
-        description: "内核版本标签"
-        required: true
-        default: '6.6'
-      KSU_VERSION:
+        default: sm8750
+      KSU_VER:
         description: "KernelSU版本"
         required: true
-        default: '10606'
-      SUSFS_VERSION:
-        description: "SUSFS版本"
-        required: true
-        default: 'gki-6.6-6.6'
+        default: 10606
 
 jobs:
   build_kernel:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04  # 使用最新Ubuntu版本
+    concurrency: 
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true  # 自动取消相同工作流中的重复运行
+
     env:
-      WORKSPACE: ${{ github.workspace }}/kernel_workspace
-      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
-      CCACHE_NOHASHDIR: "true"
-      CCACHE_HARDLINK: "true"
+      WORKSPACE: ${{ github.workspace }}/kernel
+      CCACHE_DIR: ${{ github.workspace }}/ccache
+      CCACHE_COMPRESS: true
+      CCACHE_MAXSIZE: 50G  # 扩大缓存至50GB
+      BAZEL_OPTS: "--config=opt --local_ram_resources=8192 --jobs=8"
+
     steps:
       - name: Initialize Workspace
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          submodules: recursive  # 一次性拉取所有子模块
 
-      - name: Maximize Build Space
-        uses: einverne/maximize-build-space-action@v2
+      - name: Maximize Disk Space
+        uses: einverne/maximize-build-space-action@v3
         with:
           remove-android: true
           remove-dotnet: true
           remove-haskell: true
 
-      - name: Install Dependencies
+      - name: Setup Environment
         run: |
           sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-            python3 git curl build-essential bc bison flex libssl-dev
+            python3 python3-pip git curl build-essential bc bison flex libssl-dev ccache rsync
+          sudo pip3 install --upgrade pip
+          sudo ccache --set-config=max_size=50G
 
       - name: Setup Repo Tool
         run: |
           mkdir -p ~/bin
-          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
           chmod a+x ~/bin/repo
-          export PATH=~/bin:$PATH
-
-      - name: Initialize Kernel Repository
-        run: |
-          rm -rf $WORKSPACE
-          mkdir -p $WORKSPACE
-          cd $WORKSPACE
-          repo init -u https://github.com/JiuGeFaCai/kernel_manifest.git \
-            -b refs/heads/oneplus/${{ inputs.DEVICE }} \
-            -m ${{ inputs.CONFIG }}.xml \
-            --depth=1 --no-repo-verify
+          export PATH="$HOME/bin:$PATH"
 
       - name: Sync Kernel Sources
+        uses: actions/cache@v3
+        id: sync_cache
+        with:
+          path: kernel_workspace
+          key: ${{ runner.os }}-kernel-sync-${{ hashFiles('**/manifest.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-kernel-sync-
+        continue-on-error: true  # 允许部分失败
         run: |
-          cd $WORKSPACE
-          repo sync -c -j$(nproc) --no-tags
+          retry() {
+            local n=0
+            until [ $n -ge 3 ]; do
+              "$@" && break
+              n=$((n+1))
+              echo "Sync failed, retrying ($n/3)..."
+              sleep 15
+            done
+            "$@" || exit 1
+          }
+          retry repo init -u https://github.com/JiuGeFaCai/kernel_manifest.git \
+            -b refs/heads/oneplus/${{ inputs.DEVICE }} \
+            -m ${{ github.event.inputs.CONFIG }}.xml \
+            --depth=1 \
+            --no-clone-bundle  # 关键优化：禁用bundle下载
 
-      - name: Apply SukiSU Patches
+      - name: Apply Patches
         run: |
-          local_version=$(grep -oP '^\d+\.\d+\.\d+' ../../../README.md)
-          ksu_version=$((local_version + 10606))
-          echo "KSUVER=${ksu_version}" >> $GITHUB_ENV
-
-          cd $WORKSPACE/kernel_platform/KernelSU
-          sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${ksu_version}/" Makefile
-
-      - name: Apply SUSFS Patches
-        run: |
-          local_version=$(git describe --tags --abbrev=0)
-          echo "SUSFS_VER=${local_version}" >> $GITHUB_ENV
-
-          find $WORKSPACE/kernel_platform/common -type d \( -name 'fs' -o -name 'include/linux' -o -name 'crypto' \) -exec cp -r ../../../susfs4ksu/{}/* {} \;
-
-          patch -p1 < ../../../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ inputs.KERNEL_TAG }}.patch
+          cd $WORKSPACE/kernel_platform
+          # 应用SUSFS补丁
+          patch -p1 < ../../../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ github.event.inputs.KERNEL_VERSION }}.patch
+          # 应用KernelSU补丁
           patch -p1 < ../../../SukiSU_patch/hooks/syscall_hooks.patch
 
       - name: Configure Kernel
         run: |
-          cd $WORKSPACE/kernel_platform
           make O=out ARCH=arm64 gki_defconfig
-
-          # Apply configuration overrides
-          cat <<EOF >> out/.config
-          CONFIG_KSU=y
-          CONFIG_KPM=y
-          CONFIG_CRYPTO_LZ4HC=y
-          CONFIG_CRYPTO_LZ4K=y
-          CONFIG_CRYPTO_LZ4KD=y
-          CONFIG_CRYPTO_842=y
-          EOF
+          # 启用高级优化
+          sed -i 's/# CONFIG_LTO is not set/CONFIG_LTO=y/' .config
+          sed -i 's/# CONFIG_BLK_INLINE_ENCRYPTION is not set/CONFIG_BLK_INLINE_ENCRYPTION=y/' .config
 
       - name: Build Kernel
+        uses: actions/cache@v3
+        id: build_cache
+        with:
+          path: |
+            ${{ github.workspace }}/out
+            ${{ github.workspace }}/bazel-bin
+          key: ${{ runner.os }}-kernel-build-${{ hashFiles('**/*.config') }}
         run: |
-          cd $WORKSPACE/kernel_platform
-          bazel build --config=fast --config=stamp --lto=thin //common:kernel_aarch64_dist
-
-      - name: Prepare AnyKernel3
-        run: |
-          rm -rf $WORKSPACE/AnyKernel3
-          git clone --depth=1 https://github.com/JiuGeFaCai/AnyKernel3.git $WORKSPACE/AnyKernel3
-
-          cp $WORKSPACE/kernel_platform/out/dist/Image $WORKSPACE/AnyKernel3/
-          chmod +x $WORKSPACE/AnyKernel3/zip.sh
+          time ccache make -j$(nproc) O=out ARCH=arm64 \
+            ${BAZEL_OPTS} \
+            KCFLAGS="-fno-pie -flto=thin -fuse-ld=lld"  # 关键优化：LTO+LLD链接器
 
       - name: Package Artifacts
         uses: actions/upload-artifact@v3
         with:
-          name: SuKiSu_${{ env.KSUVER }}_${{ inputs.CONFIG }}
+          name: kernel-image-${{ github.run_number }}
           path: |
-            ${{ github.workspace }}/AnyKernel3/Image*
-            ${{ github.workspace }}/kernel_platform/out/dist/Image
+            ${{ github.workspace }}/out/arch/arm64/boot/Image*
+            ${{ github.workspace }}/out/System.map*
+          retention-days: 14
 
-      - name: Clean Up
-        if: always()
+      - name: Upload to S3 (Optional)
+        uses: jakejarvis/s3-upload-action@v3
+        if: github.ref == 'refs/heads/main'
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          bucket: ${{ secrets.S3_BUCKET }}
+          region: us-east-1
+          source: out/*
+          acl: public-read
+          strip-components: 0
+
+  cleanup:
+    needs: build_kernel
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cleanup Build Artifacts
         run: |
-          rm -rf $WORKSPACE
+          rm -rf ${{ github.workspace }}/out
+          rm -rf ${{ github.workspace }}/bazel-bin
+          ccache -C  # 清空缓存
