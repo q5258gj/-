@@ -1,183 +1,132 @@
- 
-name: Optimized OnePlus Kernel Builder
-
+name: OnePlus SM8750 Build Pipeline
 on:
   workflow_dispatch:
     inputs:
-      CPU:
-        description: 'CPU branch (e.g. sm8750)'
-        default: 'sm8750'
-        required: false
-      FEIL:
-        description: 'Manifest file name'
-        default: 'oneplus_13'
-        required: false
-      KERNEL_NAME:
-        description: 'Custom kernel name'
+      DEVICE:
+        description: "设备分支"
         required: true
-
-env:
-  ANDROID_VERSION: android15
-  KERNEL_VERSION: '6.6'
+        default: 'sm8750'
+      CONFIG:
+        description: "配置文件"
+        required: true
+        default: 'oneplus_13'
+      KERNEL_TAG:
+        description: "内核版本标签"
+        required: true
+        default: '6.6'
+      KSU_VERSION:
+        description: "KernelSU版本"
+        required: true
+        default: '10606'
+      SUSFS_VERSION:
+        description: "SUSFS版本"
+        required: true
+        default: 'gki-6.6-6.6'
 
 jobs:
-  build:
+  build_kernel:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-
+    env:
+      WORKSPACE: ${{ github.workspace }}/kernel_workspace
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
     steps:
-    # 环境优化
-    - name: Maximize build space
-      uses: easimon/maximize-build-space@master
-      with:
-        root-reserve-mb: 8192
-        temp-reserve-mb: 2048
-        remove-dotnet: 'true'
-        remove-android: 'true'
+      - name: Initialize Workspace
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
 
-    # 缓存机制
-    - name: Cache Bazel artifacts
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cache/bazel
-          kernel_workspace/.repo
-        key: ${{ runner.os }}-${{ inputs.CPU }}-${{ hashFiles('**/WORKSPACE') }}-v3
+      - name: Maximize Build Space
+        uses: einverne/maximize-build-space-action@v2
+        with:
+          remove-android: true
+          remove-dotnet: true
+          remove-haskell: true
 
-    # 安全配置
-    - name: Secure Git config
-      run: |
-        git config --global user.name "github-actions"
-        git config --global user.email "github-actions@github.com"
-        git config --global protocol.file.allow always
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            python3 git curl build-essential bc bison flex libssl-dev
 
-    # 依赖安装
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y python3 python3-pip git-core curl gnupg
+      - name: Setup Repo Tool
+        run: |
+          mkdir -p ~/bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          export PATH=~/bin:$PATH
 
-    # 安全下载 repo 工具
-    - name: Install repo tool (verified)
-      run: |
-        curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
-        echo "e1e86dbb9dbfa9c7a5f3abae8070f0096d61ad8b  ~/repo" | shasum -c -
-        chmod a+x ~/repo
-        sudo mv ~/repo /usr/local/bin/repo
+      - name: Initialize Kernel Repository
+        run: |
+          rm -rf $WORKSPACE
+          mkdir -p $WORKSPACE
+          cd $WORKSPACE
+          repo init -u https://github.com/JiuGeFaCai/kernel_manifest.git \
+            -b refs/heads/oneplus/${{ inputs.DEVICE }} \
+            -m ${{ inputs.CONFIG }}.xml \
+            --depth=1 --no-repo-verify
 
-    # 代码同步
-    - name: Initialize and sync repo
-      run: |
-        mkdir -p kernel_workspace
-        cd kernel_workspace
-        repo init -u https://github.com/wanwei1028/kernel_manifest \
-          -b refs/heads/oneplus/${{ inputs.CPU }} \
-          -m ${{ inputs.FEIL }}.xml \
-          --depth=1 \
-          --no-clone-bundle
-        repo sync -c -j$(nproc) \
-          --no-tags \
-          --optimized-fetch \
-          --force-sync
+      - name: Sync Kernel Sources
+        run: |
+          cd $WORKSPACE
+          repo sync -c -j$(nproc) --no-tags
 
-    # KernelSU 安全集成
-    - name: Setup KernelSU (pinned version)
-      run: |
-        cd kernel_workspace/kernel_platform
-        KSU_COMMIT="a1b2c3d4e5f6"  # 替换为实际提交哈希
-        git clone https://github.com/tiann/KernelSU --branch main --single-branch
-        cd KernelSU
-        git checkout $KSU_COMMIT
-        bash kernel/setup.sh susfs-dev
-        echo "KSUVER=$(git rev-list --count HEAD)" >> $GITHUB_ENV
+      - name: Apply SukiSU Patches
+        run: |
+          local_version=$(grep -oP '^\d+\.\d+\.\d+' ../../../README.md)
+          ksu_version=$((local_version + 10606))
+          echo "KSUVER=${ksu_version}" >> $GITHUB_ENV
 
-    # 安全补丁应用
-    - name: Apply SUSFS patches
-      run: |
-        cd kernel_workspace
-        SUSFS_COMMIT="f6e5d4c3b2a1"  # 替换为实际提交哈希
-        git clone https://gitlab.com/simonpunk/susfs4ksu.git
-        cd susfs4ksu && git checkout $SUSFS_COMMIT && cd ..
-        
-        # 验证补丁签名
-        if ! git -C susfs4ksu verify-commit $SUSFS_COMMIT; then
-          echo "SUSFS patch verification failed!"
-          exit 1
-        fi
+          cd $WORKSPACE/kernel_platform/KernelSU
+          sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${ksu_version}/" Makefile
 
-        cp -v susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch kernel_platform/common/
-        cd kernel_platform/common
-        patch -p1 --forward < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+      - name: Apply SUSFS Patches
+        run: |
+          local_version=$(git describe --tags --abbrev=0)
+          echo "SUSFS_VER=${local_version}" >> $GITHUB_ENV
 
-    # 优化构建配置
-    - name: Configure kernel build
-      run: |
-        cd kernel_workspace/kernel_platform
-        CONFIG_FILE="common/arch/arm64/configs/gki_defconfig"
-        
-        # 模块化配置管理
-        cat << EOF >> $CONFIG_FILE
-        # KernelSU
-        CONFIG_KSU=y
-        CONFIG_KPM=y
-        
-        # SUSFS
-        CONFIG_KSU_SUSFS=y
-        CONFIG_KSU_SUSFS_ENABLE_LOG=y
-        
-        # LZ4K
-        CONFIG_CRYPTO_LZ4K=y
-        EOF
-        
-        # 移除冗余检查
-        sed -i '/check_defconfig/d' common/build.config.gki
+          find $WORKSPACE/kernel_platform/common -type d \( -name 'fs' -o -name 'include/linux' -o -name 'crypto' \) -exec cp -r ../../../susfs4ksu/{}/* {} \;
 
-    # 高效构建
-    - name: Build with Bazel (optimized)
-      run: |
-        cd kernel_workspace/kernel_platform
-        bazel run --config=fast \
-          --jobs=$(nproc) \
-          --disk_cache=~/.cache/bazel-disk-cache \
-          --remote_cache=https://your-cache-server \
-          //common:kernel_aarch64_dist -- --dist_dir=dist
-        
-        # 清理中间文件
-        find . -name '*.o' -delete
-        find . -name '*.tmp' -delete
+          patch -p1 < ../../../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ inputs.KERNEL_TAG }}.patch
+          patch -p1 < ../../../SukiSU_patch/hooks/syscall_hooks.patch
 
-    # 镜像处理
-    - name: Process kernel image
-      timeout-minutes: 15
-      run: |
-        cd kernel_workspace/kernel_platform/dist
-        curl -LO https://github.com/ShirkNeko/SukiSU_KernelPatch_patch/releases/download/v1.2.3/patch_linux
-        echo "a1b2c3d4e5f6... patch_linux" | sha256sum -c -
-        chmod +x patch_linux
-        ./patch_linux || { echo "Patching failed!"; exit 1; }
-        mv oImage Image
+      - name: Configure Kernel
+        run: |
+          cd $WORKSPACE/kernel_platform
+          make O=out ARCH=arm64 gki_defconfig
 
-    # 产物打包
-    - name: Package artifacts
-      run: |
-        git clone https://github.com/topjohnwu/AnyKernel3 --depth=1
-        cp kernel_workspace/kernel_platform/dist/Image AnyKernel3/
-        zip -r9 kernel-${{ inputs.KERNEL_NAME }}.zip AnyKernel3/*
-        
-    # 分段上传
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: kernel-${{ inputs.KERNEL_NAME }}-${{ env.KSUVER }}
-        path: |
-          kernel_workspace/kernel_platform/dist/Image
-          kernel-*.zip
-        retention-days: 7
+          # Apply configuration overrides
+          cat <<EOF >> out/.config
+          CONFIG_KSU=y
+          CONFIG_KPM=y
+          CONFIG_CRYPTO_LZ4HC=y
+          CONFIG_CRYPTO_LZ4K=y
+          CONFIG_CRYPTO_LZ4KD=y
+          CONFIG_CRYPTO_842=y
+          EOF
 
-    # 后置清理
-    - name: Cleanup
-      if: always()
-      run: |
-        rm -rf ~/.cache/bazel
-        rm -rf kernel_workspace
- 
+      - name: Build Kernel
+        run: |
+          cd $WORKSPACE/kernel_platform
+          bazel build --config=fast --config=stamp --lto=thin //common:kernel_aarch64_dist
+
+      - name: Prepare AnyKernel3
+        run: |
+          rm -rf $WORKSPACE/AnyKernel3
+          git clone --depth=1 https://github.com/JiuGeFaCai/AnyKernel3.git $WORKSPACE/AnyKernel3
+
+          cp $WORKSPACE/kernel_platform/out/dist/Image $WORKSPACE/AnyKernel3/
+          chmod +x $WORKSPACE/AnyKernel3/zip.sh
+
+      - name: Package Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: SuKiSu_${{ env.KSUVER }}_${{ inputs.CONFIG }}
+          path: |
+            ${{ github.workspace }}/AnyKernel3/Image*
+            ${{ github.workspace }}/kernel_platform/out/dist/Image
+
+      - name: Clean Up
+        if: always()
+        run: |
+          rm -rf $WORKSPACE
